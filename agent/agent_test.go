@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/agent/checks"
+	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
@@ -935,6 +936,128 @@ func TestAgent_AddCheck_GRPC(t *testing.T) {
 	}
 }
 
+func TestAgent_AddCheck_Alias(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+
+	health := &structs.HealthCheck{
+		Node:    "foo",
+		CheckID: "aliashealth",
+		Name:    "Alias health check",
+		Status:  api.HealthCritical,
+	}
+	chk := &structs.CheckType{
+		AliasService: "foo",
+	}
+	err := a.AddCheck(health, chk, false, "")
+	require.NoError(err)
+
+	// Ensure we have a check mapping
+	sChk, ok := a.State.Checks()["aliashealth"]
+	require.True(ok, "missing aliashealth check")
+	require.NotNil(sChk)
+	require.Equal(api.HealthCritical, sChk.Status)
+
+	chkImpl, ok := a.checkAliases["aliashealth"]
+	require.True(ok, "missing aliashealth check")
+	require.Equal("", chkImpl.RPCReq.Token)
+
+	cs := a.State.CheckState("aliashealth")
+	require.NotNil(cs)
+	require.Equal("", cs.Token)
+}
+
+func TestAgent_AddCheck_Alias_setToken(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+
+	health := &structs.HealthCheck{
+		Node:    "foo",
+		CheckID: "aliashealth",
+		Name:    "Alias health check",
+		Status:  api.HealthCritical,
+	}
+	chk := &structs.CheckType{
+		AliasService: "foo",
+	}
+	err := a.AddCheck(health, chk, false, "foo")
+	require.NoError(err)
+
+	cs := a.State.CheckState("aliashealth")
+	require.NotNil(cs)
+	require.Equal("foo", cs.Token)
+
+	chkImpl, ok := a.checkAliases["aliashealth"]
+	require.True(ok, "missing aliashealth check")
+	require.Equal("foo", chkImpl.RPCReq.Token)
+}
+
+func TestAgent_AddCheck_Alias_userToken(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), `
+acl_token = "hello"
+	`)
+	defer a.Shutdown()
+
+	health := &structs.HealthCheck{
+		Node:    "foo",
+		CheckID: "aliashealth",
+		Name:    "Alias health check",
+		Status:  api.HealthCritical,
+	}
+	chk := &structs.CheckType{
+		AliasService: "foo",
+	}
+	err := a.AddCheck(health, chk, false, "")
+	require.NoError(err)
+
+	cs := a.State.CheckState("aliashealth")
+	require.NotNil(cs)
+	require.Equal("", cs.Token) // State token should still be empty
+
+	chkImpl, ok := a.checkAliases["aliashealth"]
+	require.True(ok, "missing aliashealth check")
+	require.Equal("hello", chkImpl.RPCReq.Token) // Check should use the token
+}
+
+func TestAgent_AddCheck_Alias_userAndSetToken(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), `
+acl_token = "hello"
+	`)
+	defer a.Shutdown()
+
+	health := &structs.HealthCheck{
+		Node:    "foo",
+		CheckID: "aliashealth",
+		Name:    "Alias health check",
+		Status:  api.HealthCritical,
+	}
+	chk := &structs.CheckType{
+		AliasService: "foo",
+	}
+	err := a.AddCheck(health, chk, false, "goodbye")
+	require.NoError(err)
+
+	cs := a.State.CheckState("aliashealth")
+	require.NotNil(cs)
+	require.Equal("goodbye", cs.Token)
+
+	chkImpl, ok := a.checkAliases["aliashealth"]
+	require.True(ok, "missing aliashealth check")
+	require.Equal("goodbye", chkImpl.RPCReq.Token)
+}
+
 func TestAgent_RemoveCheck(t *testing.T) {
 	t.Parallel()
 	a := NewTestAgent(t.Name(), `
@@ -1383,12 +1506,12 @@ func TestAgent_PersistProxy(t *testing.T) {
 	file := filepath.Join(a.Config.DataDir, proxyDir, stringHash("redis-proxy"))
 
 	// Proxy is not persisted unless requested
-	require.NoError(a.AddProxy(proxy, false, ""))
+	require.NoError(a.AddProxy(proxy, false, false, ""))
 	_, err := os.Stat(file)
 	require.Error(err, "proxy should not be persisted")
 
 	// Proxy is  persisted if requested
-	require.NoError(a.AddProxy(proxy, true, ""))
+	require.NoError(a.AddProxy(proxy, true, false, ""))
 	_, err = os.Stat(file)
 	require.NoError(err, "proxy should be persisted")
 
@@ -1404,7 +1527,7 @@ func TestAgent_PersistProxy(t *testing.T) {
 	proxy.Config = map[string]interface{}{
 		"foo": "bar",
 	}
-	require.NoError(a.AddProxy(proxy, true, ""))
+	require.NoError(a.AddProxy(proxy, true, false, ""))
 
 	content, err = ioutil.ReadFile(file)
 	require.NoError(err)
@@ -1451,7 +1574,7 @@ func TestAgent_PurgeProxy(t *testing.T) {
 		Command:         []string{"/bin/sleep", "3600"},
 	}
 	proxyID := "redis-proxy"
-	require.NoError(a.AddProxy(proxy, true, ""))
+	require.NoError(a.AddProxy(proxy, true, false, ""))
 
 	file := filepath.Join(a.Config.DataDir, proxyDir, stringHash("redis-proxy"))
 
@@ -1461,7 +1584,7 @@ func TestAgent_PurgeProxy(t *testing.T) {
 	require.NoError(err, "should not be removed")
 
 	// Re-add the proxy
-	require.NoError(a.AddProxy(proxy, true, ""))
+	require.NoError(a.AddProxy(proxy, true, false, ""))
 
 	// Removed
 	require.NoError(a.RemoveProxy(proxyID, true))
@@ -1499,7 +1622,7 @@ func TestAgent_PurgeProxyOnDuplicate(t *testing.T) {
 		Command:         []string{"/bin/sleep", "3600"},
 	}
 	proxyID := "redis-proxy"
-	require.NoError(a.AddProxy(proxy, true, ""))
+	require.NoError(a.AddProxy(proxy, true, false, ""))
 
 	a.Shutdown()
 
@@ -1523,7 +1646,7 @@ func TestAgent_PurgeProxyOnDuplicate(t *testing.T) {
 
 	file := filepath.Join(a.Config.DataDir, proxyDir, stringHash(proxyID))
 	_, err := os.Stat(file)
-	require.Error(err, "should have removed remote state")
+	require.NoError(err, "Config File based proxies should be persisted too")
 
 	result := a2.State.Proxy(proxyID)
 	require.NotNil(result)
@@ -2753,7 +2876,7 @@ func TestAgent_AddProxy(t *testing.T) {
 			}
 			require.NoError(a.AddService(reg, nil, false, ""))
 
-			err := a.AddProxy(tt.proxy, false, "")
+			err := a.AddProxy(tt.proxy, false, false, "")
 			if tt.wantErr {
 				require.Error(err)
 				return
@@ -2813,7 +2936,7 @@ func TestAgent_RemoveProxy(t *testing.T) {
 		ExecMode:        structs.ProxyExecModeDaemon,
 		Command:         []string{"foo"},
 	}
-	require.NoError(a.AddProxy(pReg, false, ""))
+	require.NoError(a.AddProxy(pReg, false, false, ""))
 
 	// Test the ID was created as we expect.
 	gotProxy := a.State.Proxy("web-proxy")
@@ -2829,4 +2952,69 @@ func TestAgent_RemoveProxy(t *testing.T) {
 	// Removing invalid proxy should be an error
 	err = a.RemoveProxy("foobar", false)
 	require.Error(err)
+}
+
+func TestAgent_ReLoadProxiesFromConfig(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t.Name(),
+		`node_name = "node1"
+	`)
+	defer a.Shutdown()
+	require := require.New(t)
+
+	// Register a target service we can use
+	reg := &structs.NodeService{
+		Service: "web",
+		Port:    8080,
+	}
+	require.NoError(a.AddService(reg, nil, false, ""))
+
+	proxies := a.State.Proxies()
+	require.Len(proxies, 0)
+
+	config := config.RuntimeConfig{
+		Services: []*structs.ServiceDefinition{
+			&structs.ServiceDefinition{
+				Name: "web",
+				Connect: &structs.ServiceConnect{
+					Native: false,
+					Proxy:  &structs.ServiceDefinitionConnectProxy{},
+				},
+			},
+		},
+	}
+
+	require.NoError(a.loadProxies(&config))
+
+	// ensure we loaded the proxy
+	proxies = a.State.Proxies()
+	require.Len(proxies, 1)
+
+	// store the auto-generated token
+	ptok := ""
+	pid := ""
+	for id := range proxies {
+		pid = id
+		ptok = proxies[id].ProxyToken
+		break
+	}
+
+	// reload the proxies and ensure the proxy token is the same
+	require.NoError(a.unloadProxies())
+	proxies = a.State.Proxies()
+	require.Len(proxies, 0)
+	require.NoError(a.loadProxies(&config))
+	proxies = a.State.Proxies()
+	require.Len(proxies, 1)
+	require.Equal(ptok, proxies[pid].ProxyToken)
+
+	// make sure when the config goes away so does the proxy
+	require.NoError(a.unloadProxies())
+	proxies = a.State.Proxies()
+	require.Len(proxies, 0)
+
+	// a.config contains no services or proxies
+	require.NoError(a.loadProxies(a.config))
+	proxies = a.State.Proxies()
+	require.Len(proxies, 0)
 }
